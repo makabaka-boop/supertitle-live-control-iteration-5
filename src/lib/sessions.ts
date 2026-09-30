@@ -13,6 +13,7 @@ import type {
   FrameContent,
   FrameState,
   HandoffRecord,
+  UndoFrameEligibility,
   WireMessage,
 } from '../types';
 import {
@@ -24,7 +25,9 @@ import {
 } from './protocol';
 import { StageLock } from './locks';
 import {
+  BlackoutLockedError,
   consumeHandoff as dbConsumeHandoff,
+  CueNotInFrozenProgramError,
   engageBlackoutLock as dbEngageBlackoutLock,
   HandoffExpiredError,
   HandoffTargetMismatchError,
@@ -32,10 +35,14 @@ import {
   loadBlackoutLock,
   loadFrame,
   loadHandoff,
+  loadUndoFrame,
   publishFrame as dbPublishFrame,
   releaseBlackoutLock as dbReleaseBlackoutLock,
   saveHandoff,
   startPerformance,
+  undoPreviousFrame as dbUndoPreviousFrame,
+  UndoNotAvailableError,
+  UndoTargetMismatchError,
 } from './db';
 
 export const CHANNEL_NAME = 'opera-stage-bus';
@@ -80,6 +87,8 @@ export type ViewerStatus =
 export interface SessionSnapshot {
   status: ViewerStatus;
   frame: FrameState | null;
+  /** 当前 leader 在本代次可消费一次的“撤销上一帧”资格；其他状态均为 null。 */
+  undo: UndoFrameEligibility | null;
   error: string | null;
   /** 仅 leader 有意义：在线可交权的排队候选。 */
   candidates: CandidateInfo[];
@@ -146,6 +155,7 @@ export abstract class BaseSession {
   protected snapshot: SessionSnapshot = {
     status: { role: 'viewer', controller: null },
     frame: null,
+    undo: null,
     error: null,
     candidates: [],
     designation: null,
@@ -201,13 +211,18 @@ export abstract class BaseSession {
    */
   async hydrateFrame(): Promise<void> {
     try {
-      const [frame, lock] = await Promise.all([loadFrame(), loadBlackoutLock()]);
+      const [frame, lock, undo] = await Promise.all([
+        loadFrame(),
+        loadBlackoutLock(),
+        loadUndoFrame(),
+      ]);
       const patch: Partial<SessionSnapshot> = {};
       if (frame && isNewerFrame(this.snapshot.frame, frame)) {
         patch.frame = frame;
       }
       // 持久真相为准：无论本页此前看到什么，锁定状态以库内记录为准。
       patch.blackoutLock = lock;
+      patch.undo = undo;
       this.emit(patch);
     } catch (err) {
       this.emit({ error: `读取已确认画面失败：${describe(err)}` });
@@ -430,6 +445,7 @@ export class ControllerSession extends BaseSession {
     // 持久真相先成立，再对外发布。
     this.emit({
       frame,
+      undo: null,
       error: null,
       designation: null,
       handoffGen: 0,
@@ -492,6 +508,7 @@ export class ControllerSession extends BaseSession {
     this.generation = 0;
     this.emit({
       status: { role: 'lost', generation: lostGen },
+      undo: null,
       candidates: [],
       designation: null,
       handoffGen: 0,
@@ -513,15 +530,60 @@ export class ControllerSession extends BaseSession {
     if (!this.lock.isLeader || this.generation === 0) {
       throw new Error('本页已失去控制权，不能操控画面');
     }
-    const next = await dbPublishFrame({
+    const result = await dbPublishFrame({
       controllerId: this.identity.id,
       generation: this.generation,
       content,
     });
-    // 到此处事务已提交；先更新本地，再广播。
-    this.emit({ frame: next, error: null });
-    this.send({ type: 'frame', frame: next });
-    return next;
+    // 到此处帧与撤销资格已在同一事务提交；先更新本地，再广播。
+    this.emit({ frame: result.frame, undo: result.undo, error: null });
+    this.send({ type: 'frame', frame: result.frame });
+    return result.frame;
+  }
+
+  /**
+   * 撤销刚才那次普通发布：数据库把前一帧内容以更大序号重新发布，并在同事务
+   * 清除资格。投影端因此只会看到新序号，不会把它当成迟到的旧画面。
+   * 写入失败时资格、控制台、持久帧与投影均保持不变，可由当前控制者重试。
+   */
+  async undoPreviousFrame(): Promise<FrameState> {
+    if (!this.lock.isLeader || this.generation === 0) {
+      throw new Error('本页已失去控制权，不能撤销画面');
+    }
+    const eligibility = this.snapshot.undo;
+    const current = this.snapshot.frame;
+    if (
+      !eligibility ||
+      eligibility.generation !== this.generation ||
+      eligibility.controllerId !== this.identity.id ||
+      !current ||
+      current.generation !== eligibility.publishedFrame.generation ||
+      current.sequence !== eligibility.publishedFrame.sequence
+    ) {
+      throw new Error('没有可撤销的上一帧（资格不存在、已消费或已失效）');
+    }
+    let result;
+    try {
+      result = await dbUndoPreviousFrame({
+        controllerId: this.identity.id,
+        generation: this.generation,
+      });
+    } catch (err) {
+      // 资格已被持久层确认失效（重新采用 / 接管 / 紧急锁定 / 已消费 / 目标帧
+      // 已变化）时同步清掉本页资格；写盘故障则保留资格与当前帧以便重试。
+      if (
+        err instanceof UndoNotAvailableError ||
+        err instanceof UndoTargetMismatchError ||
+        err instanceof CueNotInFrozenProgramError ||
+        err instanceof BlackoutLockedError
+      ) {
+        this.emit({ undo: null });
+      }
+      throw err;
+    }
+    this.emit({ frame: result.frame, undo: null, error: null });
+    this.send({ type: 'frame', frame: result.frame });
+    return result.frame;
   }
 
   /**
@@ -544,6 +606,7 @@ export class ControllerSession extends BaseSession {
     // 事务已提交：先本地确认，再广播帧与锁定状态。
     this.emit({
       frame: result.frame,
+      undo: null,
       blackoutLock: result.lock,
       error: null,
     });
@@ -647,7 +710,8 @@ export class ControllerSession extends BaseSession {
       // 单调更新，迟到的旧通知不回退版本。
       const prev = this.snapshot.programVersion;
       if (prev === null || msg.frozenAt >= prev) {
-        this.emit({ programVersion: msg.frozenAt });
+        // 重新采用在同一事务内清掉了撤销资格；内存资格也必须立即失效。
+        this.emit({ programVersion: msg.frozenAt, undo: null });
       }
       return;
     }

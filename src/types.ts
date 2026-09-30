@@ -72,11 +72,31 @@ export interface FrameState {
   publishedAt: number;
 }
 
+/**
+ * “一次撤销上一帧”的持久资格。它不是回退序号：撤销时会把 previousFrame
+ * 的内容包装成同代次、更大序号的新帧。资格只属于创建它的控制者与代次，
+ * 且只可使用一次；接管、指定交权、重新采用、紧急锁定都会清掉旧资格。
+ */
+export interface UndoFrameEligibility {
+  /** 只有这一代的控制者可使用本资格。 */
+  generation: number;
+  /** 只有创建该资格的当前控制者可使用本资格。 */
+  controllerId: string;
+  /** 误发布后当前已确认的帧；撤销时持久当前帧必须仍与它的序号一致。 */
+  publishedFrame: FrameState;
+  /** 撤销时要以更高序号重新发布的前一帧内容。 */
+  previousFrame: FrameState;
+}
+
 /** IndexedDB 中持久化的整体演出状态。 */
 export interface PersistedState {
   draft: ProgramDraft;
   frozen: FrozenProgram | null;
   frame: FrameState | null;
+  /**
+   * 一次撤销上一帧资格。旧库存没有此键时按 null 读取，即“不可撤销”。
+   */
+  undo: UndoFrameEligibility | null;
   /**
    * 紧急黑场锁定。独立键持久化：存在即锁定中，不存在（含旧库存无此键）
    * 即未锁定。锁定跨代次（普通接管 / 指定交权 / 重新采用）持续存在，

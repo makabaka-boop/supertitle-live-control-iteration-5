@@ -12,6 +12,7 @@ import type {
   FrozenProgram,
   HandoffRecord,
   ProgramDraft,
+  UndoFrameEligibility,
 } from '../types';
 import {
   isContentInFrozenProgram,
@@ -26,6 +27,7 @@ const STORE = 'kv';
 const KEY_DRAFT = 'draft';
 const KEY_FROZEN = 'frozen';
 const KEY_FRAME = 'frame';
+const KEY_UNDO = 'undo-frame';
 const KEY_META = 'meta';
 const KEY_HANDOFF = 'handoff';
 const KEY_BLACKOUT_LOCK = 'blackout-lock';
@@ -130,6 +132,22 @@ export class CueNotInFrozenProgramError extends Error {
   constructor() {
     super('画面条目不在最新冻结节目中（已删除或已修改），不能发布');
     this.name = 'CueNotInFrozenProgramError';
+  }
+}
+
+/** 当前不存在属于本控制者、本代次的“一次撤销上一帧”资格。 */
+export class UndoNotAvailableError extends Error {
+  constructor() {
+    super('没有可撤销的上一帧（或资格已随接管 / 交权 / 重新采用 / 紧急锁定失效）');
+    this.name = 'UndoNotAvailableError';
+  }
+}
+
+/** 持久撤销资格记录的帧已不是当前帧，旧控制页重试不能撤销新操作。 */
+export class UndoTargetMismatchError extends Error {
+  constructor() {
+    super('撤销资格对应的画面已不是当前确认帧，不能撤销新操作');
+    this.name = 'UndoTargetMismatchError';
   }
 }
 
@@ -248,6 +266,7 @@ export async function loadPersisted(): Promise<{
   draft: ProgramDraft;
   frozen: FrozenProgram | null;
   frame: FrameState | null;
+  undo: UndoFrameEligibility | null;
   blackoutLock: BlackoutLock | null;
 }> {
   const db = await openDb();
@@ -257,6 +276,8 @@ export async function loadPersisted(): Promise<{
     draft: await readDraft(store),
     frozen: (await getValue<FrozenProgram>(store, KEY_FROZEN)) ?? null,
     frame: (await getValue<FrameState>(store, KEY_FRAME)) ?? null,
+    // 旧库存没有此键：天然按“不可撤销”读取。
+    undo: (await getValue<UndoFrameEligibility>(store, KEY_UNDO)) ?? null,
     // 旧库存没有此键：天然按“未锁定”读取。
     blackoutLock:
       (await getValue<BlackoutLock>(store, KEY_BLACKOUT_LOCK)) ?? null,
@@ -321,6 +342,9 @@ export async function adoptProgram(
       draftRev: draft.draftRev,
     };
     putValue(store, KEY_FROZEN, snapshot);
+    // 节目单已重新冻结：旧控制页不得再沿用上一笔发布留下的撤销资格，
+    // 即使撤销目标恰好仍在新节目中也不允许（资格是按旧冻结节目建立的）。
+    deleteValue(store, KEY_UNDO);
     return snapshot;
   });
 }
@@ -393,8 +417,21 @@ export async function startPerformance(
       publishedAt: now,
     };
     putValue(store, KEY_FRAME, frame);
+    // 新代次 / 新控制者从首帧重新开始：任何上一控制者或上一代的撤销资格
+    // 都不得沿用。
+    deleteValue(store, KEY_UNDO);
     return { generation, frame, blackoutLock };
   });
+}
+
+export interface PublishFrameResult {
+  frame: FrameState;
+  /**
+   * 本笔普通 cue / 普通黑场发布所建立的一次撤销资格；与帧在同一事务落盘。
+   * 它指向发布前 current，因此撤销不是旧序号重放，而是把前一帧内容以
+   * current.sequence + 1 再发布成一幅更新的帧。
+   */
+  undo: UndoFrameEligibility;
 }
 
 /**
@@ -412,7 +449,7 @@ export async function publishFrame(args: {
   generation: number;
   content: FrameContent;
   now?: number;
-}): Promise<FrameState> {
+}): Promise<PublishFrameResult> {
   const { controllerId, generation, content } = args;
   const now = args.now ?? Date.now();
   const db = await openDb();
@@ -452,8 +489,16 @@ export async function publishFrame(args: {
       content,
       publishedAt: now,
     };
+    const undo: UndoFrameEligibility = {
+      generation,
+      controllerId,
+      publishedFrame: next,
+      previousFrame: current,
+    };
+    // 当前帧与“可撤销的前一帧”一次确认；写任一失败则二者都不变。
     putValue(store, KEY_FRAME, next);
-    return next;
+    putValue(store, KEY_UNDO, undo);
+    return { frame: next, undo };
   });
 }
 
@@ -466,6 +511,96 @@ export async function loadFrame(): Promise<FrameState | null> {
     tx,
     async () => (await getValue<FrameState>(store, KEY_FRAME)) ?? null,
   );
+}
+
+/** 读取一次撤销资格；旧库存没有该键时为 null（不可撤销）。 */
+export async function loadUndoFrame(): Promise<UndoFrameEligibility | null> {
+  const db = await openDb();
+  const tx = db.transaction(STORE, 'readonly');
+  const store = tx.objectStore(STORE);
+  return txPromise(
+    tx,
+    async () => (await getValue<UndoFrameEligibility>(store, KEY_UNDO)) ?? null,
+  );
+}
+
+export interface UndoFrameResult {
+  frame: FrameState;
+}
+
+/**
+ * 一次撤销上一帧。撤销绝不写回旧序号，而是在同一读写事务内：
+ *   1) 核对持久代次、当前帧控制者仍属于调用方；
+ *   2) 读取撤销资格：必须存在，且 generation/controllerId 与调用方一致；
+ *   3) 资格中的 publishedFrame 必须仍是当前帧：旧控制页或重复点击不能撤销
+ *      后来发生的新发布 / 新撤销；
+ *   4) 用最新冻结节目重新裁决 previousFrame.content：重新采用后目标 cue 已
+ *      不属于冻结节目时拒绝；显式黑场始终有效；
+ *   5) 把前一帧内容写成 sequence + 1 的新帧，并清除资格（只能撤销一次）。
+ * 事务失败时当前帧与资格都回滚，不向控制台或投影产生任何可见变化。
+ */
+export async function undoPreviousFrame(args: {
+  controllerId: string;
+  generation: number;
+  now?: number;
+}): Promise<UndoFrameResult> {
+  const now = args.now ?? Date.now();
+  const db = await openDb();
+  const tx = db.transaction(STORE, 'readwrite');
+  const store = tx.objectStore(STORE);
+
+  return txPromise(tx, async () => {
+    const meta = (await getValue<Meta>(store, KEY_META)) ?? { generation: 0 };
+    if (meta.generation !== args.generation) {
+      throw new StaleGenerationError(args.generation, meta.generation);
+    }
+    const current = await getValue<FrameState>(store, KEY_FRAME);
+    if (
+      !current ||
+      current.controllerId !== args.controllerId ||
+      current.generation !== args.generation
+    ) {
+      throw new ControllerMismatchError();
+    }
+
+    const undo = await getValue<UndoFrameEligibility>(store, KEY_UNDO);
+    if (
+      !undo ||
+      undo.generation !== args.generation ||
+      undo.controllerId !== args.controllerId
+    ) {
+      throw new UndoNotAvailableError();
+    }
+    if (
+      current.generation !== undo.publishedFrame.generation ||
+      current.sequence !== undo.publishedFrame.sequence ||
+      current.controllerId !== undo.publishedFrame.controllerId
+    ) {
+      throw new UndoTargetMismatchError();
+    }
+
+    const frozen = await getValue<FrozenProgram>(store, KEY_FROZEN);
+    const lock = await getValue<BlackoutLock>(store, KEY_BLACKOUT_LOCK);
+    if (lock && !isExplicitBlackout(undo.previousFrame.content)) {
+      throw new BlackoutLockedError();
+    }
+    if (!isContentInFrozenProgram(undo.previousFrame.content, frozen ?? null)) {
+      throw new CueNotInFrozenProgramError();
+    }
+
+    const next: FrameState = {
+      generation: args.generation,
+      sequence: current.sequence + 1,
+      controllerId: args.controllerId,
+      controllerLabel: current.controllerLabel,
+      content: undo.previousFrame.content,
+      publishedAt: now,
+    };
+    putValue(store, KEY_FRAME, next);
+    // 一次资格随撤销消费；连续点第二次只能被拒绝，不能继续回退更早画面。
+    deleteValue(store, KEY_UNDO);
+    return { frame: next };
+  });
 }
 
 /** 读取紧急黑场锁定（无记录时为 null；旧库存自然没有此键，按未锁定处理）。 */
@@ -532,9 +667,10 @@ export async function engageBlackoutLock(args: {
       content: { kind: 'blackout', cueId: null, source: '', translation: '' },
       publishedAt: now,
     };
-    // 同一事务：锁定状态 + 已确认黑场帧原子写入。
+    // 同一事务：锁定状态 + 已确认黑场帧原子写入，并使旧撤销资格失效。
     putValue(store, KEY_BLACKOUT_LOCK, lock);
     putValue(store, KEY_FRAME, frame);
+    deleteValue(store, KEY_UNDO);
     return { lock, frame };
   });
 }
@@ -671,6 +807,9 @@ export async function consumeHandoff(
       publishedAt: now,
     };
     putValue(store, KEY_FRAME, frame);
+    // 新代次 / 新控制者从首帧重新开始：任何上一控制者或上一代的撤销资格
+    // 都不得沿用。
+    deleteValue(store, KEY_UNDO);
     return { generation, frame, blackoutLock };
   });
 }

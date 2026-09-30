@@ -31,6 +31,7 @@ export function ControlPage({ capabilities }: ControlPageProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [handoffError, setHandoffError] = useState<string | null>(null);
   const [handoffPending, setHandoffPending] = useState(false);
+  const [undoPending, setUndoPending] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
   const [lockPending, setLockPending] = useState(false);
 
@@ -107,6 +108,14 @@ export function ControlPage({ capabilities }: ControlPageProps) {
   const isLost = snapshot.status.role === 'lost';
   // 紧急黑场锁定：跨接管 / 交权 / 重新采用存活，以持久记录（经会话同步）为准。
   const isLocked = snapshot.blackoutLock !== null;
+  const canUndo =
+    isLeader &&
+    snapshot.undo !== null &&
+    snapshot.undo.generation ===
+      (snapshot.status.role === 'leader' ? snapshot.status.generation : 0) &&
+    snapshot.undo.controllerId === session.controllerId &&
+    snapshot.frame?.generation === snapshot.undo.generation &&
+    snapshot.frame?.sequence === snapshot.undo.publishedFrame.sequence;
   const lostGeneration =
     snapshot.status.role === 'lost' ? snapshot.status.generation : 0;
   const waitingController =
@@ -170,6 +179,20 @@ export function ControlPage({ capabilities }: ControlPageProps) {
 
   function explicitBlackout() {
     void send({ kind: 'blackout', cueId: null, source: '', translation: '' });
+  }
+
+  async function undoLastFrame() {
+    setActionError(null);
+    setUndoPending(true);
+    try {
+      await session.undoPreviousFrame();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : `撤销失败：${String(err)}`,
+      );
+    } finally {
+      setUndoPending(false);
+    }
   }
 
   // 紧急黑场锁定：锁定记录与已确认黑场帧一笔事务确认后才生效 / 广播。
@@ -323,6 +346,14 @@ export function ControlPage({ capabilities }: ControlPageProps) {
               onClick={explicitBlackout}
             >
               ● 黑场（单帧，不锁定）
+            </button>
+            <button
+              className="btn undo-button"
+              data-testid="undo-frame-btn"
+              disabled={!canUndo || undoPending}
+              onClick={() => void undoLastFrame()}
+            >
+              ↩ 撤销上一帧（以前一内容发布更高序号；仅一次）
             </button>
 
             {/* 紧急黑场锁定：锁定记录 + 已确认黑场帧一笔事务原子写入。 */}

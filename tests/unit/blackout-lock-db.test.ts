@@ -156,8 +156,8 @@ describe('设置紧急黑场锁定（单事务：锁定 + 已确认黑场帧）'
       generation: g.generation,
       content: BLACK,
     });
-    expect(f.content).toEqual(BLACK);
-    expect(f.sequence).toBe(locked.frame.sequence + 1);
+    expect(f.frame.content).toEqual(BLACK);
+    expect(f.frame.sequence).toBe(locked.frame.sequence + 1);
     // 锁定原样保留（不重设、不解除）。
     const lockAfter = await loadBlackoutLock();
     expect(lockAfter?.lockedAt).toBe(1000);
@@ -189,7 +189,7 @@ describe('解除紧急黑场锁定', () => {
       generation: g.generation,
       content: { kind: 'subtitle', cueId: 'c2', source: 'Oh', translation: '哦' },
     });
-    expect(next.content.translation).toBe('哦');
+    expect(next.frame.content.translation).toBe('哦');
   });
 
   it('未锁定时解除幂等：不抛错、不写帧', async () => {
@@ -231,7 +231,7 @@ describe('解除紧急黑场锁定', () => {
       generation: g2.generation,
       content: { kind: 'subtitle', cueId: 'c1', source: 'Ah', translation: '啊' },
     });
-    expect(ok.content.translation).toBe('啊');
+    expect(ok.frame.content.translation).toBe('啊');
   });
 
   it('同代次冒充者不能解除：ControllerMismatchError，锁定保留', async () => {
@@ -339,7 +339,7 @@ describe('锁定跨普通接管 / 指定交权 / 重新采用持续存在', () =
       generation: 2,
       content: { kind: 'subtitle', cueId: 'c2', source: 'Oh', translation: '哦' },
     });
-    expect(ok.content.translation).toBe('哦');
+    expect(ok.frame.content.translation).toBe('哦');
   });
 
   it('重新采用不影响锁定：锁定仍在，新节目的 cue 同样被拦', async () => {

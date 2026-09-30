@@ -138,10 +138,10 @@ describe('发布画面的事务栅栏', () => {
       generation: g2.generation,
       content: { kind: 'subtitle', cueId: 'b', source: 'la', translation: '啦' },
     });
-    expect(f1.generation).toBe(2);
-    expect(f1.sequence).toBe(1);
+    expect(f1.frame.generation).toBe(2);
+    expect(f1.frame.sequence).toBe(1);
     const stored = await loadFrame();
-    expect(stored).toEqual(f1);
+    expect(stored).toEqual(f1.frame);
   });
 
   it('失锁旧页用旧代次发布：抛 StaleGenerationError 且画面保持新代次', async () => {
@@ -177,8 +177,8 @@ describe('发布画面的事务栅栏', () => {
       generation: g2.generation,
       content: { kind: 'blackout', cueId: null, source: '', translation: '' },
     });
-    expect(f.content.kind).toBe('blackout');
-    expect(f.content.cueId).toBeNull();
+    expect(f.frame.content.kind).toBe('blackout');
+    expect(f.frame.content.cueId).toBeNull();
   });
 });
 
@@ -231,7 +231,7 @@ describe('重新采用后：发布与接管都以最新冻结节目为准', () =
       generation: g.generation,
       content: { kind: 'subtitle', cueId: 'a', source: '新原文', translation: '新译文' },
     });
-    expect(ok.content.translation).toBe('新译文');
+    expect(ok.frame.content.translation).toBe('新译文');
   });
 
   it('被删除的黑场条目不能再点出；显式黑场仍可', async () => {
