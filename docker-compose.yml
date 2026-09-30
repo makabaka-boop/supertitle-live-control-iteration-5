@@ -1,0 +1,25 @@
+# 宿主端口由 WEB_PORT 覆盖（默认 8080）：WEB_PORT=9000 docker compose up --build
+# verify 是一次性校验服务：构建并跑完 Vitest + Playwright 后退出。
+services:
+  web:
+    build:
+      context: .
+      target: runtime
+    image: opera-prompter:runtime
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: opera-prompter:verify
+    # 单跑：docker compose build verify && docker compose run --rm verify
+    # 或只跑其中一段：docker compose run --rm verify npm run test:unit
+    command: ["sh", "-c", "npm run test:unit && npm run test:e2e"]
+    security_opt:
+      - no-new-privileges:true
