@@ -129,6 +129,19 @@ export function ControlPage({ capabilities }: ControlPageProps) {
     }
   }
 
+  // 一次撤销上一帧：前一帧内容以更高序号重新发布（不是回退序号），
+  // 投影端按序号栅栏当新画面接受；资格一次性，事务失败画面不变。
+  async function undo() {
+    setActionError(null);
+    try {
+      await session.undoLastFrame();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : `撤销失败：${String(err)}`,
+      );
+    }
+  }
+
   async function designate(targetId: string) {
     setHandoffError(null);
     setHandoffPending(true);
@@ -316,6 +329,16 @@ export function ControlPage({ capabilities }: ControlPageProps) {
                 下一句 ↓
               </button>
             </div>
+            {/* 一次撤销上一帧：仅限当前控制者、当前代次；前一帧以更高序号重新发布。 */}
+            <button
+              className="btn undo-button"
+              data-testid="undo-btn"
+              disabled={!isLeader || isLocked || !snapshot.canUndo}
+              onClick={() => void undo()}
+              title="把上一幅画面以新序号重新发布（仅可撤销最近一次普通切句/黑场）"
+            >
+              ↶ 撤销上一帧（仅一次）
+            </button>
             <button
               className="btn danger big-stage-button"
               data-testid="blackout-btn"

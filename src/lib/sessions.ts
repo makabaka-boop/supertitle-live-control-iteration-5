@@ -36,6 +36,7 @@ import {
   releaseBlackoutLock as dbReleaseBlackoutLock,
   saveHandoff,
   startPerformance,
+  undoLastFrame as dbUndoLastFrame,
 } from './db';
 
 export const CHANNEL_NAME = 'opera-stage-bus';
@@ -98,6 +99,13 @@ export interface SessionSnapshot {
    * 投影页不使用本字段（只按帧显示）。
    */
   blackoutLock: BlackoutLock | null;
+  /**
+   * 仅当前持锁控制页有意义：是否持有“一次撤销上一帧”资格。
+   * 普通 cue / 普通黑场确认后置真；撤销确认、接管 / 交权（换代次）、紧急
+   * 黑场锁定、重新采用节目单、失锁后均置假。持久真相在 IndexedDB（undo 键），
+   * 本字段只是控制台 UI 的镜像，一切裁决仍在撤销事务内完成。
+   */
+  canUndo: boolean;
 }
 
 type Listener = (snapshot: SessionSnapshot) => void;
@@ -152,6 +160,7 @@ export abstract class BaseSession {
     handoffGen: 0,
     programVersion: null,
     blackoutLock: null,
+    canUndo: false,
   };
   protected bus: BroadcastChannel | null;
   private listeners = new Set<Listener>();
@@ -434,6 +443,8 @@ export class ControllerSession extends BaseSession {
       designation: null,
       handoffGen: 0,
       blackoutLock,
+      // 新代次不沿用旧控制者 / 旧代次的撤销资格。
+      canUndo: false,
       candidates: [],
       status: {
         role: 'leader',
@@ -495,6 +506,8 @@ export class ControllerSession extends BaseSession {
       candidates: [],
       designation: null,
       handoffGen: 0,
+      // 失锁后撤销资格随之失效：本页任何操作都不能再改变画面。
+      canUndo: false,
     });
     // 携带本页代次退场：旧代次的退场不会清掉更新代次的新控制者。
     this.send({
@@ -505,7 +518,7 @@ export class ControllerSession extends BaseSession {
   }
 
   /**
-   * 切句 / 黑场：同一事务核对控制者与代次、递增序号并保存画面，
+   * 切句 / 黑场：同一事务核对控制者与代次、递增序号并保存画面与撤销资格，
    * 提交成功后才经 BroadcastChannel 发布。
    * 失败时库内仍是上一幅确认画面，错误上抛给 UI 显示。
    */
@@ -519,9 +532,37 @@ export class ControllerSession extends BaseSession {
       content,
     });
     // 到此处事务已提交；先更新本地，再广播。
-    this.emit({ frame: next, error: null });
+    // 紧急锁定中的单帧黑场不产生撤销资格（持久层未写 undo 键）：
+    // 持锁者自身的锁定状态是权威（它不听命任何 blackout-lock 消息）。
+    this.emit({
+      frame: next,
+      error: null,
+      canUndo: this.snapshot.blackoutLock === null,
+    });
     this.send({ type: 'frame', frame: next });
     return next;
+  }
+
+  /**
+   * 一次撤销上一帧：把可撤销的前一帧内容以**更高序号**在同一事务里重新发布，
+   * 并清除本次撤销资格（不是回退序号，投影端序号栅栏照常把它当新画面接受）。
+   * 资格仅限当前控制者、当前代次、当前帧：接管 / 指定交权 / 重新采用 /
+   * 紧急锁定后，以及撤销成功或重复撤销时，事务内即拒绝，画面与持久帧不变。
+   * 事务提交成功后才广播；写入失败或旧控制页重试不会改变控制台、投影与持久帧。
+   */
+  async undoLastFrame(now: number = Date.now()): Promise<FrameState> {
+    if (!this.lock.isLeader || this.generation === 0) {
+      throw new Error('本页已失去控制权，不能撤销画面');
+    }
+    const restored = await dbUndoLastFrame({
+      controllerId: this.identity.id,
+      generation: this.generation,
+      now,
+    });
+    // 事务已提交：先本地确认（资格已一次性清掉），再广播。
+    this.emit({ frame: restored, error: null, canUndo: false });
+    this.send({ type: 'frame', frame: restored });
+    return restored;
   }
 
   /**
@@ -546,6 +587,8 @@ export class ControllerSession extends BaseSession {
       frame: result.frame,
       blackoutLock: result.lock,
       error: null,
+      // 锁定事务已删除撤销资格：锁定后不得借撤销恢复锁定前字幕。
+      canUndo: false,
     });
     this.send({ type: 'frame', frame: result.frame });
     this.send({
@@ -647,7 +690,12 @@ export class ControllerSession extends BaseSession {
       // 单调更新，迟到的旧通知不回退版本。
       const prev = this.snapshot.programVersion;
       if (prev === null || msg.frozenAt >= prev) {
-        this.emit({ programVersion: msg.frozenAt });
+        this.emit({
+          programVersion: msg.frozenAt,
+          // 重新采用后旧撤销资格不得沿用：目标 cue 可能已不属于当前冻结节目单；
+          // 即便目标仍有效，也由撤销事务内的冻结栅栏再次裁决。
+          canUndo: false,
+        });
       }
       return;
     }

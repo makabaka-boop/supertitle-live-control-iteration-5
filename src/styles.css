@@ -472,6 +472,19 @@ button {
   font-size: 15px;
 }
 
+/* 一次撤销上一帧：救场入口，介于普通按钮与黑场之间的醒目暖色。 */
+.undo-button {
+  width: 100%;
+  padding: 10px;
+  font-size: 14px;
+  border-color: #8a6d2f;
+  background: #3a3117;
+}
+
+.undo-button:hover:not(:disabled) {
+  background: #4a3f1f;
+}
+
 /* 紧急黑场锁定：比普通黑场更醒目的持续锁定入口。 */
 .emergency-lock-button {
   padding: 14px;

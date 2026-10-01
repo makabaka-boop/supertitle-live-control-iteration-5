@@ -72,6 +72,35 @@ export interface FrameState {
   publishedAt: number;
 }
 
+/**
+ * “一次撤销上一帧”资格记录。
+ * 发布普通 cue 或普通黑场时，在发布事务内把“当前帧（即可撤销恢复的前一帧）”
+ * 连同资格一起写入；撤销不是回退序号，而是把前一帧内容以更高序号重新发布。
+ *
+ * 资格严格绑定当前控制者与当前代次：
+ *  - generation/controllerId 不匹配（接管、指定交权后的旧页重试）一律拒绝；
+ *  - publishSequence 必须仍等于当前帧序号（重复撤销、其间又有新帧即失效）；
+ *  - 撤销确认的同一事务内删除本记录，资格一次性；
+ *  - 接管、指定交权、紧急黑场锁定的事务主动删除本记录；
+ *  - 紧急黑场锁定期间发布的单帧黑场不产生本记录。
+ * 旧库存没有本键：天然按“不可撤销”读取，无需迁移。
+ */
+export interface UndoRecord {
+  /** 资格所属代次：仅该代次的控制者可使用。 */
+  generation: number;
+  /** 资格所属控制者身份：仅本人可撤销。 */
+  controllerId: string;
+  /**
+   * 产生本资格的那次发布所确认的帧序号。撤销时当前帧序号必须仍等于它：
+   * 已撤销（记录被删）、重复撤销、旧控制页重试、其间又确认了新帧都据此拒绝。
+   */
+  publishSequence: number;
+  /** 可撤销恢复的前一帧（完整快照；撤销时以其 content 重新发布）。 */
+  previousFrame: FrameState;
+  /** 资格写入时间戳。 */
+  createdAt: number;
+}
+
 /** IndexedDB 中持久化的整体演出状态。 */
 export interface PersistedState {
   draft: ProgramDraft;
@@ -83,6 +112,11 @@ export interface PersistedState {
    * 只有当前持锁且代次匹配的控制页可在单事务中写入 / 解除。
    */
   blackoutLock: BlackoutLock | null;
+  /**
+   * “一次撤销上一帧”资格。独立键持久化：仅当前控制者、当前代次可使用一次；
+   * 接管 / 指定交权 / 紧急锁定时在事务内删除，旧库存无此键即不可撤销。
+   */
+  undo: UndoRecord | null;
 }
 
 /**
